@@ -1,0 +1,26 @@
+[project]
+name = "produsicai"
+version = "0.1.0"
+description = "AI assistant for music production"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "chromadb>=0.5.15",
+    "google-api-python-client>=2.149.0",
+    "ipykernel>=6.29.5",
+    "ipywidgets>=8.1.5",
+    "langchain>=1.4.8",
+    "langchain-chroma>=0.1.4",
+    "langchain-community>=0.3.3",
+    "langchain-google-genai>=4.4.2",
+    "langchain-openai>=0.2.8",
+    "langgraph>=0.2.41",
+    "nest-asyncio>=1.6.0",
+    "nicegui>=2.5.0",
+    "pandas>=2.2.3",
+    "pyautogen>=0.3.1",
+    "ruff>=0.7.0",
+    "sentence-transformers>=3.2.1",
+    "torch>=2.5.0",
+    "yt-dlp>=2026.10.26",
+]

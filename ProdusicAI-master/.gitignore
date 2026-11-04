@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.cache
+
+
+.venv
+.env
+
+logos/
+
+app.log
+chroma_db/
+ideas_csv.hash
+todo.md
+test.ipynb
+output.jpg
+.vscode/
+test.html
