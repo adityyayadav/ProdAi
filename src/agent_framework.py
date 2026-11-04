@@ -6,7 +6,8 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import JsonOutputParser
-from src.rag import get_random_by_category, get_ideas_db, search_youtube_song, _rag_categories
+from src.rag import get_random_by_category, get_ideas_db, _rag_categories
+from src.youtube import search_youtube_tutorial, search_youtube_song
 from src.logger import logger
 from src.config import get_config
 
@@ -62,6 +63,8 @@ class AgentState(TypedDict):
     needs_song: bool
     suggested_song: str | None
     youtube_url: str | None
+    tutorial_url: str | None
+    tutorial_title: str | None
     is_random: bool
     is_followup: bool
 
@@ -130,6 +133,7 @@ try:
         api_key=config.groq_api_key,
         base_url="https://api.groq.com/openai/v1",
         temperature=0.7,
+        max_tokens=350,
         timeout=15.0
     )
 except Exception as e:
@@ -174,45 +178,38 @@ def filter_relevant_ideas(state: Dict) -> Dict:
 
 
 def select_specialist(state: Dict) -> Dict:
-    """Select the most appropriate specialist for the query."""
+    """Select the most appropriate specialist for the query using keyword-first routing to conserve rate limits."""
     last_msg = state["messages"][-1].content.lower() if state["messages"] else ""
     
-    # Keyword-based quick hints as reliable fallback
-    matched_agent = "project_manager"
-    if any(k in last_msg for k in ["mix", "eq", "compress", "sidechain", "master", "reverb"]):
+    # 1. Fast, zero-token keyword classification
+    if any(k in last_msg for k in ["mix", "eq", "equaliz", "compress", "sidechain", "master", "reverb", "delay", "vocal", "level", "db", "gain", "pan"]):
         matched_agent = "mixing_engineer"
-    elif any(k in last_msg for k in ["synth", "sound", "patch", "sample", "texture", "bass"]):
+    elif any(k in last_msg for k in ["synth", "sound", "patch", "sample", "texture", "bass", "filter", "lfo", "oscillator", "ambient", "envelope", "drone"]):
         matched_agent = "sound_designer"
-    elif any(k in last_msg for k in ["lyric", "rhyme", "words", "verse", "chorus"]):
+    elif any(k in last_msg for k in ["lyric", "rhyme", "words", "verse", "chorus", "bridge", "hook", "poetry", "metaphor", "theme"]):
         matched_agent = "lyricist"
-    elif any(k in last_msg for k in ["chord", "melody", "harmony", "progression", "tempo", "scale"]):
+    elif any(k in last_msg for k in ["chord", "melody", "harmony", "progression", "tempo", "scale", "bpm", "songwriting", "structure", "radiohead", "key"]):
         matched_agent = "composer"
-
-    specialist_selector_prompt = ChatPromptTemplate.from_messages([
-        SystemMessage("""You are a project coordinator. Your job is to route queries to the appropriate specialist.
-                    Choose the most appropriate specialist:
-                    - composer: For composition, arrangement, and music theory
-                    - mixing_engineer: For audio processing, mixing, mastering and sound balancing
-                    - sound_designer: For audio synthesis, sound creation, and sonic textures
-                    - lyricist: For writing lyrics, themes, hooks and song narratives
-                    - project_manager: For project coordination or unclear queries
-                    
-                    Respond only with the role key, nothing else."""), 
-        MessagesPlaceholder(variable_name="messages"),
-    ])
-
-    try:
-        response = llm.invoke(
-            specialist_selector_prompt.format_messages(messages=state["previous_messages"] + state["messages"])
-        )
-        cleaned = strip_think_tags(response.content)
-        agent_key = cleaned.strip().lower().replace("*", "").replace(".", "").replace('"', '').replace("'", "")
-        for spec in SPECIALISTS:
-            if spec in agent_key:
-                matched_agent = spec
-                break
-    except Exception as e:
-        logger.warning(f"Error in select_specialist LLM call, using keyword fallback: {e}")
+    else:
+        # 2. Only invoke LLM if keyword matching is ambiguous (with strict max_tokens=15)
+        specialist_selector_prompt = ChatPromptTemplate.from_messages([
+            SystemMessage("Choose the single best role: composer, mixing_engineer, sound_designer, lyricist, or project_manager. Reply ONLY with the role key."), 
+            MessagesPlaceholder(variable_name="messages"),
+        ])
+        matched_agent = "project_manager"
+        try:
+            mini_llm = llm.bind(max_tokens=15)
+            response = mini_llm.invoke(
+                specialist_selector_prompt.format_messages(messages=state["previous_messages"] + state["messages"])
+            )
+            cleaned = strip_think_tags(response.content)
+            agent_key = cleaned.strip().lower().replace("*", "").replace(".", "").replace('"', '').replace("'", "")
+            for spec in SPECIALISTS:
+                if spec in agent_key:
+                    matched_agent = spec
+                    break
+        except Exception as e:
+            logger.warning(f"Error in select_specialist LLM call, using project_manager fallback: {e}")
             
     logger.info(f"Selected specialist: {matched_agent}")
     return {**state, "current_agent": matched_agent}
@@ -227,7 +224,8 @@ def specialist_response(state: Dict) -> Dict:
     ])
 
     try:
-        response = llm.invoke(
+        specialist_llm = llm.bind(max_tokens=300)
+        response = specialist_llm.invoke(
             specialist_prompt.format_messages(
                 query=state["messages"][-1].content,
                 agent_scratchpad=[SPECIALISTS[state["current_agent"]]["system_message"]],
@@ -252,31 +250,80 @@ def needs_song_suggestion(state: Dict) -> bool:
 
 
 async def get_song_suggestion(state: Dict) -> Dict:
-    """Get song suggestion and YouTube URL when needed."""
-    song_suggester_prompt = ChatPromptTemplate.from_messages([
-        SystemMessage(""""You are a music clever with good technical knowledge and a wide range of musical tastes. 
-                    Provide a single good reference song that demonstrates the concept or technique discussed in the previous response.
-                    Format your response as "SONG_SUGGESTION: Artist - Song Title"."""), 
-        ("user", "Previous response: {specialist_response}")
-    ])
-
+    """Get video tutorial and reference song suggestion tailored directly to the user's request."""
     song = None
     youtube_url = None
+    tutorial_url = None
+    tutorial_title = None
+
+    rag_results = state.get("rag_results", [])
+    user_query = state["messages"][-1].content if state.get("messages") else ""
+    specialist_text = state["messages"][-1].content if len(state.get("messages", [])) > 1 else ""
+
+    # 1. Ask model to identify the most accurate song and tutorial topic matching the user's query
+    song_prompt = ChatPromptTemplate.from_messages([
+        SystemMessage('You are a music producer assistant. Identify 1 best reference song and 1 specific tutorial topic that directly answer the user request. Reply strictly in this format:\nSONG: Artist - Title | TUTORIAL: Topic'), 
+        ("user", "User asked: {user_query}\nSpecialist advice: {specialist_response}")
+    ])
+
+    tutorial_topic = user_query
     try:
-        response = llm.invoke(
-            song_suggester_prompt.format(specialist_response=state["messages"][-1].content)
+        mini_llm = llm.bind(max_tokens=60)
+        res = mini_llm.invoke(
+            song_prompt.format(user_query=user_query, specialist_response=specialist_text[:300])
         )
-        content = strip_think_tags(response.content.strip())
-        if "SONG_SUGGESTION:" in content:
-            song = content.split("SONG_SUGGESTION:")[1].strip().split("\n")[0].strip()
-        else:
-            song = content.split("\n")[0].strip()
-        logger.info(f"Suggesting song: {song}")
-        youtube_url = await search_youtube_song(song)
+        content = strip_think_tags(res.content.strip())
+        logger.info(f"Song/Tutorial extractor output: {content}")
+
+        # Parse SONG
+        if "SONG:" in content:
+            song_part = content.split("SONG:")[1]
+            if "|" in song_part:
+                song = song_part.split("|")[0].strip()
+            elif "TUTORIAL:" in song_part:
+                song = song_part.split("TUTORIAL:")[0].strip()
+            else:
+                song = song_part.split("\n")[0].strip()
+
+        # Parse TUTORIAL
+        if "TUTORIAL:" in content:
+            tutorial_topic = content.split("TUTORIAL:")[1].strip().split("\n")[0].strip()
+
     except Exception as e:
-        logger.warning(f"Could not get song suggestion: {e}")
+        logger.warning(f"Error extracting song/tutorial via LLM: {e}")
+
+    # Fallback to RAG document if LLM produced nothing
+    if not song and rag_results:
+        for doc in rag_results:
+            cand = getattr(doc, "Song", None)
+            if cand and isinstance(cand, str) and len(cand.strip()) > 2 and cand.lower() != "none":
+                song = cand.strip()
+                break
+
+    # 2. Search for the practical How-To Video Tutorial
+    if tutorial_topic:
+        try:
+            tut = await search_youtube_tutorial(tutorial_topic)
+            if tut:
+                tutorial_url = tut.get("url")
+                tutorial_title = tut.get("title")
+        except Exception as e:
+            logger.warning(f"Could not search YouTube tutorial: {e}")
+
+    # 3. Search for the Reference Song
+    if song:
+        try:
+            youtube_url = await search_youtube_song(song)
+        except Exception as e:
+            logger.warning(f"Could not search YouTube for song '{song}': {e}")
     
-    return {**state, "suggested_song": song, "youtube_url": youtube_url}
+    return {
+        **state, 
+        "suggested_song": song, 
+        "youtube_url": youtube_url,
+        "tutorial_url": tutorial_url,
+        "tutorial_title": tutorial_title
+    }
 
 def is_followup_question(state: Dict) -> Dict:
     """Check if this is a followup question based on message history length."""
@@ -372,6 +419,8 @@ async def invoke_agent(message: str, previous_messages: Optional[Sequence[BaseMe
         needs_song=False,
         suggested_song=None,
         youtube_url=None,
+        tutorial_url=None,
+        tutorial_title=None,
         is_random=False,
         is_followup=False
     )

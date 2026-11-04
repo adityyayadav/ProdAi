@@ -9,6 +9,13 @@ from src.config import get_config
 
 app.add_static_files('/img', 'img')
 
+def scroll_to_bottom() -> None:
+    """Scroll smoothly to the bottom of the chat window without blocking or timing out."""
+    try:
+        ui.run_javascript("window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' })", respond=False)
+    except Exception:
+        pass
+
 def init_app() -> bool:
     """Initialize the application."""
     try:
@@ -96,7 +103,7 @@ def main() -> None:
                             .props('text-color="black" bg-color="blue-3"')
             spinner = ui.spinner(type='audio', size='3em')
 
-        await ui.run_javascript("window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' })")
+        scroll_to_bottom()
         
         suggested_prompts_container.clear()
 
@@ -137,11 +144,11 @@ def main() -> None:
                             timestamps = literal_eval(timestamps) if timestamps else [""]*len(links)
                             for youtube_link, ts in zip(links, timestamps):
                                 ts_param = convert_timestamp_to_yt(ts)
-                                ui.html(create_youtube_embed(youtube_link, ts_param))
+                                ui.html(create_youtube_embed(youtube_link, ts_param, label="Technique Demo", title=getattr(doc, 'Technique', 'Demo')))
                         else:
                             ts = convert_timestamp_to_yt(doc.Timestamp)
-                            ui.html(create_youtube_embed(link, ts))
-            await ui.run_javascript("window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' })")
+                            ui.html(create_youtube_embed(link, ts, label="Technique Demo", title=getattr(doc, 'Technique', 'Demo')))
+            scroll_to_bottom()
         else:
             message_container.remove(ideas_response)
         
@@ -157,17 +164,30 @@ def main() -> None:
                     sm.props(f'name="{specialist_name}"')
                     ui.markdown(ai_message.content)
                 
-                    # If there's a verified YouTube example, show it
-                    if result.get("youtube_url"):
-                        logger.info(f"Showing YouTube example: {result['youtube_url']}")
-                        ui.html(create_youtube_embed(result["youtube_url"]))
+                    # 1. Actionable How-To Video Tutorial
+                    if result.get("tutorial_url"):
+                        logger.info(f"Showing YouTube tutorial: {result['tutorial_url']}")
+                        ui.html(create_youtube_embed(
+                            result["tutorial_url"],
+                            label="🎓 Video Tutorial",
+                            title=result.get("tutorial_title", "How-To Walkthrough")
+                        ))
+
+                    # 2. Reference Track / Song Example
+                    if result.get("youtube_url") and result.get("youtube_url") != result.get("tutorial_url"):
+                        logger.info(f"Showing Reference song: {result['youtube_url']}")
+                        ui.html(create_youtube_embed(
+                            result["youtube_url"],
+                            label="🎵 Reference Track",
+                            title=result.get("suggested_song", "Reference Track")
+                        ))
                         
-                await ui.run_javascript("window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' })")
+                scroll_to_bottom()
             else:
                 message_container.remove(specialist_message)
         
         message_container.remove(spinner)
-        await ui.run_javascript("window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' })")
+        scroll_to_bottom()
 
     # Suggested prompts container
     suggested_prompts_container = ui.column().classes('w-full max-w-2xl mx-auto my-6 items-center')
@@ -232,7 +252,7 @@ def main() -> None:
                 .classes('w-full self-center').on('keydown.enter', send)
             ui.button(icon='delete_forever', on_click=reset_conversation).props('flat').tooltip('clear conversation')
 
-ui.run(title='ProdusicAI', 
+ui.run(title='ProdAi', 
        favicon='img/logo2.png',
        host='0.0.0.0', 
        port=8001)
